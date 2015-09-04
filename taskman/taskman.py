@@ -14,25 +14,42 @@ import logger
 
 class Task(object):
 
-    next_id = 0
+    _next_id = 0
     TypeUser = 0
     TypeConfirm = 1
     TypeRetry = 2
 
-    ProceedUnknown = 255
-    ProceedOK = 0
-    ProceedKO = 1
-
     def __init__(self):
         self.name = self.__class__.__name__
+        self.id = Task._next_id
         self.desc = ""
         self.type = Task.TypeUser
         self.settings = {}
         self._cond_proceed = threading.Condition()
-        Task.next_id += 1
+        self._callbacks = {
+            "message": self._handle_message
+        }
+        self._loader_id = -1
+        Task._next_id += 1
 
     def _set_settings(self, settings):
         self.settings = settings
+
+    def set_callback(self, name, cb):
+        self._callbacks[name] = cb
+
+    def _handle_message(self, message):
+        logger.log('d', "Message: %s", message)
+
+    def message(self, text, params={}):
+        self._callbacks["message"]({
+            "message": {
+                "origin": "task",
+                "text": text,
+                "params": params,
+                "task": {"name": self.name, "loader_id": self._loader_id}
+            }
+        })
 
     def prereq(self):
         return 0
@@ -51,13 +68,13 @@ class Task(object):
 
 class ConfirmTask(Task):
 
-    def __init__(self, message):
+    def __init__(self, message_text):
         super(ConfirmTask, self).__init__()
         self.type = Task.TypeConfirm
-        self.message = message
+        self.message_text = message_text
 
     def run(self):
-        logger.log('d', "Confirm: %s" % self.message)
+        self.message(self.message_text)
         self._cond_proceed.acquire()
         self._cond_proceed.wait()
         self._cond_proceed.release()
@@ -77,6 +94,7 @@ class RetryTask(Task):
         self._answer = ""
 
     def run(self):
+        self.message("Retry?")
         self._cond_proceed.acquire()
         self._cond_proceed.wait()
         self._cond_proceed.release()
@@ -112,6 +130,7 @@ class TaskLoader():
             "abort_on_fail": False
         }
         self._callbacks = {
+            "message": self._handle_message,
             "handle_abort": None
         }
         self.event_done = threading.Event()
@@ -121,12 +140,31 @@ class TaskLoader():
             for key in loader_settings.keys():
                 self.settings[key] = loader_settings[key]
 
-        if tasks_settings is not None:
-            for task in tasks:
+        for task in tasks:
+            task._loader_id = self.id
+            if tasks_settings is not None:
                 task._set_settings(tasks_settings)
 
-    def set_callback(self, name, cb):
+
+    def set_callback(self, name, cb, extend_to_tasks=False):
         self._callbacks[name] = cb
+        if extend_to_tasks:
+            for task in self.tasks:
+                if name in task._callbacks.keys():
+                    task.set_callback(name, cb)
+
+    def _handle_message(self, message):
+        logger.log('d', "Message: %s", message)
+
+    def message(self, text, params={}):
+        self._callbacks["message"]({
+            "message": {
+                "origin": "loader",
+                "text": text,
+                "params": params,
+                "loader": {"id": self.id}
+            }
+        })
 
     def reset(self):
         for task in self.tasks:
@@ -154,10 +192,12 @@ class TaskLoader():
 
         for dep in self._deps:
             logger.log('d', "TaskLoader %d waiting for %d" % (self.id, dep.id))
+            self.message("loader.wait", {"dep_id": dep.id})
             while not dep.event_done.is_set():
                 dep.event_done.wait()
 
-        logger.log('d', "TaskLoader run")
+        logger.log('d', "TaskLoader %d run" % self.id)
+        self.message("loader.running")
         self.run_iteration += 1
 
         tasks_count = len(self.tasks)
@@ -168,6 +208,7 @@ class TaskLoader():
             task = self.tasks[it]
             self.current_task = task
             logger.log('d', "%s" % task.name)
+            self.message("loader.current_task", {"task_name": task.name})
             if task.type is Task.TypeRetry:
                 if last_failed:
                     rewind = task.run()
@@ -192,6 +233,7 @@ class TaskLoader():
             it += 1
 
         logger.log('d', "TaskLoader done")
+        self.message("loader.done")
         self.event_done.set()
 
         return 0
@@ -213,17 +255,34 @@ class TaskController:
         self._queue = Queue.Queue()
         self._rpc_callbacks = {
             "quit": self.quit,
-            "task_loader.list": self.taskloader_list,
-            "task_loader.run_all": self.taskloader_runall,
-            "task_loader.run": self.taskloader_run,
+            "loader.list": self.loader_list,
+            "loader.run_all": self.loader_runall,
+            "loader.run": self.loader_run,
             "task.proceed": self.task_proceed,
             "task.retry": self.task_retry
         }
 
+        for task_loader in self._task_loaders:
+            task_loader.set_callback("message", self._handle_message, extend_to_tasks=True)
+
+    def _handle_message(self, text):
+        logger.log('d', "Message: %s" % text)
+        for skt in self._clients:
+            skt.send(str(text) + "\n\r")
+
+    def message(self, text, params={}):
+        self._handle_message({
+            "message": {
+                "origin": "controller",
+                "text": text,
+                "params": params,
+            }
+        })
+
     def quit(self):
         self._request_to_quit = True
 
-    def taskloader_list(self):
+    def loader_list(self):
         logger.log('d', "TaskLoader LIST BEGIN")
         for task_loader in self._task_loaders:
             logger.log('d', " ID: %d" % task_loader.id)
@@ -231,11 +290,11 @@ class TaskController:
                 logger.log('d', "  %s" % task.name)
         logger.log('d', "TaskLoader LIST END")
 
-    def taskloader_runall(self):
+    def loader_runall(self):
         for task_loader in self._task_loaders:
             threading._start_new_thread(task_loader.run, ())
 
-    def taskloader_run(self, id):
+    def loader_run(self, id):
         id = int(id)
         logger.log('d', "TaskLoader run id=%d" % id)
         if id >= 0 and (id < len(self._task_loaders)):
@@ -265,31 +324,34 @@ class TaskController:
                     logger.log('d', "current task (%s) is not of \"Retry\" type" % current_task.name)
                 return
 
-    def _send_data(self, data):
-        if len(self._clients) > 0:
-            self._clients[0].send(data)
-
-    def send_result(self, id, status):
-        self._send_data(json.dumps({
-            "result": status,
-            "id": id
-        }))
+    def send_data(self, data):
+        data_pkt = {
+            "data": data
+        }
+        self._queue.put(data_pkt)
 
     def run(self, count=0):
         logger.log('d', "TaskController is running...")
         while self._request_to_quit is False:
-            rpc = self._queue.get()
-            self._handle_rpc(rpc)
+            pkt = self._queue.get()
+            pkt_keys = pkt.keys()
+            if "rpc" in pkt_keys:
+                self._handle_rpc(pkt)
+            elif "data" in pkt_keys:
+                for skt in self._clients:
+                    skt.send(pkt)
 
     def connect(self, hostname, port):
         self._alive = True
         self._server.bind((hostname, port))
         self._server.listen(1)
         self._thread_listener.start()
+        self.message("server.connected")
 
     def disconnect(self):
         self._alive = False
         #self._thread_listener.join(10000)
+        self.message("server.disconnected")
         self._server.close()
 
     def _listener(self):
@@ -306,10 +368,11 @@ class TaskController:
         print("Server closed")
 
     def _handle_rpc(self, rpc):
-        if "method" not in rpc.keys():
+        if "rpc" not in rpc.keys():
             # Invalid RPC. And that's fine.
             logger.log('d', "invalid RPC: \"method\" element not found")
             pass
+        rpc = rpc["rpc"]
         rpc_method = rpc["method"]
         rpc_params = rpc["params"]
         if rpc_method in self._rpc_callbacks.keys():
@@ -326,10 +389,9 @@ class TaskController:
             logger.log('d', "%s is not a Remote Procedure Call" % rpc["method"])
 
     def _handle_client(self, skt, addr):
-        logger.log('d', "handle client %d %s" % (skt.fileno(), addr))
+        logger.log('d', "Client connected: %s %d" % (addr[0], skt.fileno()))
 
         def _handle_data_in(data):
-
             data = data.replace('\r', '')
             fields = data.split(' ')
             if len(fields) < 1:
@@ -343,12 +405,13 @@ class TaskController:
                         param_name = param_fields[0]
                         param_value = param_fields[1]
                         params.update({param_name: param_value})
-                rpc = {
-                    "method": method,
-                    "params": params,
-                    "skt": skt
+                rpc_pkt = {
+                    "rpc": {
+                        "method": method,
+                        "params": params,
+                    }
                 }
-                self._queue.put(rpc)
+                self._queue.put(rpc_pkt)
 
         data_parser = SerialParser()
         data_parser.set_callback("parsed", _handle_data_in)
@@ -365,7 +428,7 @@ class TaskController:
         self._lock.acquire()
         self._clients.remove(skt)
         self._lock.release()
-        logger.log('i', "Connection closed: %s" % addr[0])
+        logger.log('i', "Client disconnected: %s %d" % (addr[0], skt.fileno()))
 
 
 class TestTask1(Task):

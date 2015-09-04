@@ -1,4 +1,0 @@
-METHOD              PARAMS
-task_loader.list
-task_loader.run     <id>
-confirm
