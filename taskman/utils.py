@@ -1,6 +1,14 @@
 from os import getcwd, path, chdir, devnull, system
 from distutils.dir_util import remove_tree, mkpath, copy_tree
 from subprocess import call
+from StringIO import StringIO
+
+class StreamToCallback(StringIO):
+    def __init__(self, cb):
+        self.cb = cb
+
+    def write(self, buf):
+        self.cb(buf)
 
 def clean_path(dir_name):
     if path.exists(dir_name):
@@ -16,12 +24,17 @@ def create_path(dir_name):
     if not path.exists(dir_name):
         mkpath(dir_name)
 
-def call_cmd(line, verbose=False):
+def call_cmd(line, verbose=False, stdout_cb=None):
     if verbose:
-        print line
-        return call(line)
+        print "CMD: %s" % line
+        if stdout_cb is None:
+            return call(line)
+        else:
+            #s2cb = StreamToCallback(stdout_cb)
+            s2cb = StringIO()
+            return call(line, stdout=s2cb)
     else:
-        return call(line, stdout=dnull)
+        return call(line, stdout=None)
 
 def cp(root_src, root_dest, rel_path):
     print "Copying %s from %s to %s" % (rel_path, root_src, root_dest)
@@ -90,3 +103,4 @@ class JsonParser(DataParser):
 
             if done and self._callback["parsed"] is not None:
                 self._callback["parsed"](self.parsed_str)
+
